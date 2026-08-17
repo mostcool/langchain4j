@@ -2,6 +2,7 @@ package dev.langchain4j.model.google.genai;
 
 import static java.util.Collections.singletonList;
 
+import dev.langchain4j.exception.InvalidRequestException;
 import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.model.chat.common.AbstractStreamingChatModelListenerIT;
 import dev.langchain4j.model.chat.listener.ChatModelListener;
@@ -38,7 +39,7 @@ class GoogleGenAiStreamingChatModelListenerIT extends AbstractStreamingChatModel
 
     @Override
     protected Class<? extends Exception> expectedExceptionClass() {
-        return com.google.genai.errors.ClientException.class;
+        return InvalidRequestException.class;
     }
 
     @Override

@@ -12,6 +12,7 @@ import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 
 import dev.langchain4j.agent.tool.Tool;
+import dev.langchain4j.agentic.Agents.LoanApplication;
 import dev.langchain4j.agentic.Agents.AudienceEditor;
 import dev.langchain4j.agentic.Agents.CategoryRouter;
 import dev.langchain4j.agentic.Agents.CreativeWriter;
@@ -38,6 +39,10 @@ import dev.langchain4j.agentic.Agents.TechnicalExpertWithMemory;
 import dev.langchain4j.agentic.agent.AgentInvocationException;
 import dev.langchain4j.agentic.agent.ErrorRecoveryResult;
 import dev.langchain4j.agentic.agent.MissingArgumentException;
+import dev.langchain4j.guardrail.InputGuardrail;
+import dev.langchain4j.guardrail.InputGuardrailResult;
+import dev.langchain4j.guardrail.OutputGuardrail;
+import dev.langchain4j.guardrail.OutputGuardrailResult;
 import dev.langchain4j.agentic.declarative.ChatModelSupplier;
 import dev.langchain4j.agentic.internal.AgenticScopeOwner;
 import dev.langchain4j.agentic.observability.AgentInvocation;
@@ -50,6 +55,9 @@ import dev.langchain4j.agentic.planner.AgentInstance;
 import dev.langchain4j.agentic.planner.AgenticSystemConfigurationException;
 import dev.langchain4j.agentic.planner.AgenticSystemTopology;
 import dev.langchain4j.agentic.scope.AgenticScope;
+import dev.langchain4j.agentic.scope.AgenticScopeAccess;
+import dev.langchain4j.agentic.scope.AgenticScopeSerializer;
+import dev.langchain4j.agentic.scope.UnserializableAgenticScopeException;
 import dev.langchain4j.agentic.scope.AgenticScopePersister;
 import dev.langchain4j.agentic.scope.AgenticScopeRegistry;
 import dev.langchain4j.agentic.scope.ResultWithAgenticScope;
@@ -58,8 +66,12 @@ import dev.langchain4j.agentic.workflow.HumanInTheLoop;
 import dev.langchain4j.agentic.workflow.LoopAgentInstance;
 import dev.langchain4j.agentic.workflow.impl.LoopPlanner;
 import dev.langchain4j.agentic.workflow.impl.SequentialPlanner;
+import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.memory.chat.MessageWindowChatMemory;
 import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.model.chat.request.ChatRequest;
+import dev.langchain4j.model.chat.response.ChatResponse;
+import dev.langchain4j.service.MemoryId;
 import dev.langchain4j.service.SystemMessage;
 import dev.langchain4j.service.UserMessage;
 import dev.langchain4j.service.V;
@@ -279,6 +291,70 @@ public class WorkflowAgentsIT {
 
         verify(audienceEditor).editStory(any(), eq("young adults"));
         verify(styleEditor).editStory(any(), eq("fantasy"));
+    }
+
+    @Test
+    void sequential_agents_with_guardrails_tests() {
+        AtomicBoolean inputGuardrailInvoked = new AtomicBoolean(false);
+        AtomicBoolean outputGuardrailInvoked = new AtomicBoolean(false);
+
+        InputGuardrail topicGuardrail = new InputGuardrail() {
+            @Override
+            public InputGuardrailResult validate(dev.langchain4j.data.message.UserMessage userMessage) {
+                inputGuardrailInvoked.set(true);
+                if (userMessage.singleText().toLowerCase().contains("violence")) {
+                    return fatal("Topic about violence is not allowed");
+                }
+                return success();
+            }
+        };
+
+        OutputGuardrail storyLengthGuardrail = new OutputGuardrail() {
+            @Override
+            public OutputGuardrailResult validate(AiMessage responseFromLLM) {
+                outputGuardrailInvoked.set(true);
+                if (responseFromLLM.text() != null && responseFromLLM.text().length() < 10) {
+                    return fatal("Story is too short");
+                }
+                return success();
+            }
+        };
+
+        CreativeWriter creativeWriter = spy(AgenticServices.agentBuilder(CreativeWriter.class)
+                .chatModel(baseModel())
+                .inputGuardrails(topicGuardrail)
+                .outputKey("story")
+                .build());
+
+        StyleEditor styleEditor = spy(AgenticServices.agentBuilder(StyleEditor.class)
+                .chatModel(baseModel())
+                .outputGuardrails(storyLengthGuardrail)
+                .outputKey("story")
+                .build());
+
+        UntypedAgent novelCreator = AgenticServices.sequenceBuilder()
+                .subAgents(creativeWriter, styleEditor)
+                .outputKey("story")
+                .build();
+
+        Map<String, Object> input = Map.of(
+                "topic", "dragons and wizards",
+                "style", "fantasy");
+
+        String story = (String) novelCreator.invoke(input);
+        System.out.println(story);
+
+        assertThat(inputGuardrailInvoked.get()).isTrue();
+        assertThat(outputGuardrailInvoked.get()).isTrue();
+        verify(creativeWriter).generateStory("dragons and wizards");
+        verify(styleEditor).editStory(any(), eq("fantasy"));
+
+        // Verify input guardrail blocks execution when it fails
+        Map<String, Object> violentInput = Map.of(
+                "topic", "violence and war",
+                "style", "fantasy");
+
+        assertThrows(AgentInvocationException.class, () -> novelCreator.invoke(violentInput));
     }
 
     @Test
@@ -686,6 +762,45 @@ public class WorkflowAgentsIT {
         assertThat(failed.hasError()).isTrue();
         assertThat(failed.error().error()).isInstanceOf(AgentInvocationException.class);
         assertThat(failed.error().agent().name()).isEqualTo("scoreStyle");
+    }
+
+    @Test
+    void loop_agents_with_error_should_evict_ephemeral_scope() {
+        CreativeWriter creativeWriter = AgenticServices.agentBuilder(CreativeWriter.class)
+                .chatModel(baseModel())
+                .outputKey("story")
+                .build();
+
+        StyleEditor styleEditor = AgenticServices.agentBuilder(StyleEditor.class)
+                .chatModel(baseModel())
+                .outputKey("story")
+                .build();
+
+        StyleScorer styleScorer = AgenticServices.agentBuilder(StyleScorer.class)
+                .chatModel(throwingModel())
+                .outputKey("score")
+                .build();
+
+        UntypedAgent styleReviewLoop = AgenticServices.loopBuilder()
+                .name("reviewLoop")
+                .subAgents(styleScorer, styleEditor)
+                .maxIterations(5)
+                .exitCondition(agenticScope -> agenticScope.readState("score", 0.0) >= 0.8)
+                .build();
+
+        UntypedAgent styledWriter = AgenticServices.sequenceBuilder()
+                .subAgents(creativeWriter, styleReviewLoop)
+                .outputKey("story")
+                .build();
+
+        Map<String, Object> input = Map.of(
+                "topic", "dragons and wizards",
+                "style", "comedy");
+
+        assertThrows(AgentInvocationException.class, () -> styledWriter.invokeWithAgenticScope(input));
+
+        AgenticScopeRegistry registry = ((AgenticScopeOwner) styledWriter).registry();
+        assertThat(registry.getAllAgenticScopeKeysInMemory()).isEmpty();
     }
 
     @Test
@@ -1373,6 +1488,89 @@ public class WorkflowAgentsIT {
                 .allSatisfy(horoscope -> assertThat(horoscope).isNotBlank());
     }
 
+    public interface LoanExtractorAgentWithMemory {
+
+        @UserMessage("""
+            Convert user request into a structured LoanApplication.
+            The user request is: '{{request}}'.
+            """)
+        @Agent(description = "Extract a loan application", outputKey = "loanApplication")
+        LoanApplication extract(@MemoryId String memoryId, @V("request") String request);
+    }
+
+    public interface LoanProcessorWithMemory extends AgenticScopeAccess {
+
+        @Agent
+        LoanApplication processLoan(@MemoryId String memoryId, @V("request") String request);
+    }
+
+    @Test
+    void memory_agents_with_unregistered_domain_object_should_fail_deserialization() {
+        LoanExtractorAgentWithMemory extractor = AgenticServices.agentBuilder(LoanExtractorAgentWithMemory.class)
+                .chatModel(baseModel())
+                .chatMemoryProvider(memoryId -> MessageWindowChatMemory.withMaxMessages(10))
+                .outputKey("loanApplication")
+                .build();
+
+        LoanProcessorWithMemory processor = AgenticServices.sequenceBuilder(LoanProcessorWithMemory.class)
+                .subAgents(extractor)
+                .outputKey("loanApplication")
+                .build();
+
+        JsonInMemoryAgenticScopeStore store = new JsonInMemoryAgenticScopeStore();
+        AgenticScopePersister.setStore(store);
+
+        try {
+            LoanApplication result = processor.processLoan("user1",
+                    "John Smith, 35 years old, wants a loan of 10000 dollars");
+            assertThat(result).isNotNull();
+
+            AgenticScopeRegistry registry = ((AgenticScopeOwner) processor).registry();
+            registry.clearInMemory();
+
+            UnserializableAgenticScopeException ex = assertThrows(UnserializableAgenticScopeException.class,
+                    () -> processor.processLoan("user1", "What was my previous loan application?"));
+            assertThat(ex.getMessage())
+                    .contains(LoanApplication.class.getName())
+                    .contains("allowDeserializationType");
+        } finally {
+            AgenticScopePersister.setStore(null);
+        }
+    }
+
+    @Test
+    void memory_agents_with_registered_domain_object_should_deserialize_successfully() {
+        AgenticScopeSerializer.allowDeserializationType(LoanApplication.class);
+
+        LoanExtractorAgentWithMemory extractor = AgenticServices.agentBuilder(LoanExtractorAgentWithMemory.class)
+                .chatModel(baseModel())
+                .chatMemoryProvider(memoryId -> MessageWindowChatMemory.withMaxMessages(10))
+                .outputKey("loanApplication")
+                .build();
+
+        LoanProcessorWithMemory processor = AgenticServices.sequenceBuilder(LoanProcessorWithMemory.class)
+                .subAgents(extractor)
+                .outputKey("loanApplication")
+                .build();
+
+        JsonInMemoryAgenticScopeStore store = new JsonInMemoryAgenticScopeStore();
+        AgenticScopePersister.setStore(store);
+
+        try {
+            LoanApplication result = processor.processLoan("user1",
+                    "John Smith, 35 years old, wants a loan of 10000 dollars");
+            assertThat(result).isNotNull();
+
+            AgenticScopeRegistry registry = ((AgenticScopeOwner) processor).registry();
+            registry.clearInMemory();
+
+            LoanApplication result2 = processor.processLoan("user1", "What was my previous loan application?");
+            assertThat(result2).isNotNull();
+        } finally {
+            AgenticScopePersister.setStore(null);
+        }
+    }
+
     @Test
     void sequential_declarative_agents_as_classes_tests() {
         UntypedAgent novelCreator = AgenticServices.sequenceBuilder()
@@ -1387,5 +1585,77 @@ public class WorkflowAgentsIT {
         String story = (String) novelCreator.invoke(input);
         System.out.println(story);
         assertThat(story).containsIgnoringCase("dragon").containsIgnoringCase("wizard");
+    }
+
+    @Test
+    void single_agent_loop_max_iteration_test() {
+        AtomicInteger callCount = new AtomicInteger(0);
+        ChatModel countingModel = new ChatModel() {
+            @Override
+            public ChatResponse chat(ChatRequest chatRequest) {
+                callCount.incrementAndGet();
+                return ChatResponse.builder()
+                        .aiMessage(AiMessage.from("0.5"))
+                        .build();
+            }
+        };
+
+        Agents.StyleScorer scorer = AgenticServices.agentBuilder(Agents.StyleScorer.class)
+                .chatModel(countingModel)
+                .outputKey("score")
+                .build();
+
+        UntypedAgent loop = AgenticServices.loopBuilder()
+                .name("testLoop")
+                .subAgents(scorer)
+                .maxIterations(3)
+                .exitCondition("score >= 0.8", scope -> scope.readState("score", 0.0) >= 0.8)
+                .build();
+
+        loop.invokeWithAgenticScope(Map.of("story", "A test story", "style", "comedy"));
+        assertThat(callCount.get()).isEqualTo(3);
+    }
+
+    @Test
+    void multiple_agents_loop_max_iteration_test() {
+        ChatModel model = new ChatModel() {
+            @Override
+            public ChatResponse chat(ChatRequest chatRequest) {
+                return ChatResponse.builder()
+                        .aiMessage(AiMessage.from("0.5"))
+                        .build();
+            }
+        };
+
+        AtomicInteger callCount = new AtomicInteger(0);
+        ChatModel countingModel = new ChatModel() {
+            @Override
+            public ChatResponse chat(ChatRequest chatRequest) {
+                callCount.incrementAndGet();
+                return ChatResponse.builder()
+                        .aiMessage(AiMessage.from("0.5"))
+                        .build();
+            }
+        };
+
+        Agents.StyleScorer scorer = AgenticServices.agentBuilder(Agents.StyleScorer.class)
+                .chatModel(model)
+                .outputKey("score")
+                .build();
+
+        Agents.StyleScorer countingScorer = AgenticServices.agentBuilder(Agents.StyleScorer.class)
+                .chatModel(countingModel)
+                .outputKey("score")
+                .build();
+
+        UntypedAgent loop = AgenticServices.loopBuilder()
+                .name("testLoop")
+                .subAgents(scorer, countingScorer)
+                .maxIterations(3)
+                .exitCondition("score >= 0.8", scope -> scope.readState("score", 0.0) >= 0.8)
+                .build();
+
+        loop.invokeWithAgenticScope(Map.of("story", "A test story", "style", "comedy"));
+        assertThat(callCount.get()).isEqualTo(3);
     }
 }

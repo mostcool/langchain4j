@@ -7,6 +7,7 @@ import dev.langchain4j.model.chat.request.ChatRequestParameters;
 import dev.langchain4j.model.chat.request.DefaultChatRequestParameters;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 import software.amazon.awssdk.services.bedrockruntime.model.CacheTTL;
 
 public class BedrockChatRequestParameters extends DefaultChatRequestParameters {
@@ -69,6 +70,51 @@ public class BedrockChatRequestParameters extends DefaultChatRequestParameters {
         return serviceTier;
     }
 
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        if (!super.equals(o)) return false;
+        BedrockChatRequestParameters that = (BedrockChatRequestParameters) o;
+        return Objects.equals(additionalModelRequestFields, that.additionalModelRequestFields)
+                && Objects.equals(cachePointPlacement, that.cachePointPlacement)
+                && Objects.equals(cacheTtl, that.cacheTtl)
+                && Objects.equals(bedrockGuardrailConfiguration, that.bedrockGuardrailConfiguration)
+                && Objects.equals(serviceTier, that.serviceTier);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(
+                super.hashCode(),
+                additionalModelRequestFields,
+                cachePointPlacement,
+                cacheTtl,
+                bedrockGuardrailConfiguration,
+                serviceTier);
+    }
+
+    @Override
+    public String toString() {
+        return "BedrockChatRequestParameters{" + "modelName="
+                + modelName() + ", temperature="
+                + temperature() + ", topP="
+                + topP() + ", topK="
+                + topK() + ", frequencyPenalty="
+                + frequencyPenalty() + ", presencePenalty="
+                + presencePenalty() + ", maxOutputTokens="
+                + maxOutputTokens() + ", stopSequences="
+                + stopSequences() + ", toolSpecifications="
+                + toolSpecifications() + ", toolChoice="
+                + toolChoice() + ", responseFormat="
+                + responseFormat() + ", additionalModelRequestFields="
+                + additionalModelRequestFields + ", cachePointPlacement="
+                + cachePointPlacement + ", cacheTtl="
+                + cacheTtl + ", bedrockGuardrailConfiguration="
+                + bedrockGuardrailConfiguration + ", serviceTier="
+                + serviceTier + '}';
+    }
+
     public static class Builder extends DefaultChatRequestParameters.Builder<Builder> {
 
         private Map<String, Object> additionalModelRequestFields;
@@ -126,6 +172,31 @@ public class BedrockChatRequestParameters extends DefaultChatRequestParameters {
                 Map<?, ?> reasoningConfig =
                         Map.ofEntries(Map.entry("type", "enabled"), Map.entry("budget_tokens", tokenBudget));
                 additionalModelRequestFields.put("reasoning_config", reasoningConfig);
+            }
+            return this;
+        }
+
+        /**
+         * Enables <a href="https://docs.aws.amazon.com/bedrock/latest/userguide/inference-reasoning.html">adaptive reasoning</a>,
+         * required for Claude Opus 4.7+ where the legacy {@code budget_tokens} reasoning configuration is no longer accepted.
+         * Older models (e.g. Claude Opus 4.6, Sonnet 4.6) continue to work with {@link #enableReasoning(Integer)}.
+         *
+         * @param effort controls reasoning intensity, serialized to Bedrock's {@code output_config.effort} field.
+         *               Accepted values: {@code "low"}, {@code "medium"}, {@code "high"}.
+         *               If {@code null}, only {@code reasoning_config.type = "adaptive"} is set and Bedrock applies its default.
+         * @see BedrockChatModel.Builder#returnThinking(Boolean)
+         * @see BedrockChatModel.Builder#sendThinking(Boolean)
+         */
+        public Builder enableAdaptiveReasoning(String effort) {
+            if (additionalModelRequestFields == null) {
+                additionalModelRequestFields = new HashMap<>();
+            }
+            Map<?, ?> reasoningConfig = Map.ofEntries(Map.entry("type", "adaptive"));
+            additionalModelRequestFields.put("reasoning_config", reasoningConfig);
+
+            if (effort != null) {
+                Map<?, ?> outputConfig = Map.ofEntries(Map.entry("effort", effort));
+                additionalModelRequestFields.put("output_config", outputConfig);
             }
             return this;
         }

@@ -6,6 +6,7 @@ import dev.langchain4j.invocation.InvocationContext;
 import dev.langchain4j.service.tool.ToolExecutionResult;
 import java.util.List;
 import java.util.Map;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Represents a client that can communicate with an MCP server over a given transport protocol,
@@ -17,6 +18,13 @@ public interface McpClient extends AutoCloseable {
      * Returns the unique key of this client.
      */
     String key();
+
+    /**
+     * Returns the server instructions from the initialize result, or null if the server did not provide any.
+     */
+    default @Nullable String instructions() {
+        return null;
+    }
 
     /**
      * Obtains a list of tools from the MCP server.
@@ -76,13 +84,45 @@ public interface McpClient extends AutoCloseable {
      * Subscribes to updates for the resource with the specified URI.
      * When the resource changes, the server will send a {@code notifications/resources/updated} notification.
      * The client will invoke the {@code onResourceUpdated} callback (if configured) with the URI of the updated resource.
+     *
+     * @deprecated Use {@link #subscribeToResources(List)} for MCP 2026-07-28 and later.
+     *             Throws {@link UnsupportedOperationException} when using the modern protocol.
      */
+    @Deprecated(since = "1.19.0-beta29")
     void subscribeToResource(String uri);
 
     /**
      * Unsubscribes from updates for the resource with the specified URI.
+     *
+     * @deprecated Use {@link #unsubscribeFromResources(long)} for MCP 2026-07-28 and later.
+     *             Throws {@link UnsupportedOperationException} when using the modern protocol.
      */
+    @Deprecated(since = "1.19.0-beta29")
     void unsubscribeFromResource(String uri);
+
+    /**
+     * Subscribes to resource content update notifications for the given URIs.
+     * Returns a subscription ID that can be used to unsubscribe later.
+     * Only available with MCP protocol version 2026-07-28 and later.
+     *
+     * @param uris the list of resource URIs to subscribe to
+     * @return a subscription ID
+     * @throws UnsupportedOperationException when using legacy protocol (2025-11-25)
+     */
+    default long subscribeToResources(List<String> uris) {
+        throw new UnsupportedOperationException("subscribeToResources requires MCP protocol 2026-07-28 or later");
+    }
+
+    /**
+     * Unsubscribes from resource content update notifications for the given subscription ID.
+     * Only available with MCP protocol version 2026-07-28 and later.
+     *
+     * @param subscriptionId the subscription ID returned by {@link #subscribeToResources(List)}
+     * @throws UnsupportedOperationException when using legacy protocol (2025-11-25)
+     */
+    default void unsubscribeFromResources(long subscriptionId) {
+        throw new UnsupportedOperationException("unsubscribeFromResources requires MCP protocol 2026-07-28 or later");
+    }
 
     /**
      * Obtain a list of prompts available on the MCP server.
@@ -103,7 +143,12 @@ public interface McpClient extends AutoCloseable {
 
     /**
      * Sets the roots that are made available to the server upon its request.
-     * After calling this method, the client also sends a `notifications/roots/list_changed` message to the server.
+     * After calling this method, the client also sends a {@code notifications/roots/list_changed}
+     * message to the server.
+     *
+     * @deprecated Roots are deprecated in MCP protocol version 2026-07-28. This method throws
+     *     {@link UnsupportedOperationException} when the modern protocol is in use.
      */
+    @Deprecated(since = "1.19.0-beta29")
     void setRoots(List<McpRoot> roots);
 }

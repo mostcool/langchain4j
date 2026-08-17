@@ -190,14 +190,29 @@ class GoogleGenAiContentMapperTest {
     }
 
     @Test
-    void should_convert_tool_execution_result_message() {
-        ToolExecutionResultMessage message = ToolExecutionResultMessage.from("call-1", "getWeather", "Sunny, 25C");
+    void should_convert_parallel_tool_execution_result_messages() {
+        List<ChatMessage> messages = List.of(
+                ToolExecutionResultMessage.from("call-1", "getWeather", "Sunny, 25C"),
+                ToolExecutionResultMessage.from("call-2", "getWeather", "Rainy, 15C"));
 
-        Content result = GoogleGenAiContentMapper.toContent(message);
+        List<Content> results = GoogleGenAiContentMapper.toContents(messages);
 
-        assertThat(result.role().get()).isEqualTo("function");
-        assertThat(result.parts().get().get(0).functionResponse().get().name().get())
-                .isEqualTo("getWeather");
+        assertThat(results).hasSize(1);
+        Content result = results.get(0);
+        assertThat(result.role().get()).isEqualTo("user");
+
+        List<Part> parts = result.parts().get();
+        assertThat(parts).hasSize(2);
+
+        assertThat(parts.get(0).functionResponse().get().name().get()).isEqualTo("getWeather");
+        assertThat(parts.get(0).functionResponse().get().response().get().get("result"))
+                .isEqualTo("Sunny, 25C");
+        assertThat(parts.get(0).functionResponse().get().id().get()).isEqualTo("call-1");
+
+        assertThat(parts.get(1).functionResponse().get().name().get()).isEqualTo("getWeather");
+        assertThat(parts.get(1).functionResponse().get().response().get().get("result"))
+                .isEqualTo("Rainy, 15C");
+        assertThat(parts.get(1).functionResponse().get().id().get()).isEqualTo("call-2");
     }
 
     @Test
@@ -248,6 +263,52 @@ class GoogleGenAiContentMapperTest {
         assertThat(result.finishReason()).isEqualTo(FinishReason.STOP);
         assertThat(result.tokenUsage().inputTokenCount()).isEqualTo(10);
         assertThat(result.tokenUsage().outputTokenCount()).isEqualTo(5);
+    }
+
+    @Test
+    void should_use_total_token_count_from_usage_metadata() {
+        GenerateContentResponse response = GenerateContentResponse.builder()
+                .candidates(List.of(Candidate.builder()
+                        .content(Content.builder()
+                                .role("model")
+                                .parts(Part.builder().text("Hello!").build())
+                                .build())
+                        .build()))
+                .usageMetadata(GenerateContentResponseUsageMetadata.builder()
+                        .promptTokenCount(10)
+                        .candidatesTokenCount(5)
+                        .thoughtsTokenCount(7)
+                        .totalTokenCount(22)
+                        .build())
+                .build();
+
+        ChatResponse result = GoogleGenAiContentMapper.toChatResponse(response, "test-model");
+
+        assertThat(result.tokenUsage().inputTokenCount()).isEqualTo(10);
+        assertThat(result.tokenUsage().outputTokenCount()).isEqualTo(5);
+        assertThat(result.tokenUsage().totalTokenCount()).isEqualTo(22);
+    }
+
+    @Test
+    void should_fall_back_to_prompt_plus_candidates_when_total_token_count_absent() {
+        GenerateContentResponse response = GenerateContentResponse.builder()
+                .candidates(List.of(Candidate.builder()
+                        .content(Content.builder()
+                                .role("model")
+                                .parts(Part.builder().text("Hello!").build())
+                                .build())
+                        .build()))
+                .usageMetadata(GenerateContentResponseUsageMetadata.builder()
+                        .promptTokenCount(10)
+                        .candidatesTokenCount(5)
+                        .build())
+                .build();
+
+        ChatResponse result = GoogleGenAiContentMapper.toChatResponse(response, "test-model");
+
+        assertThat(result.tokenUsage().inputTokenCount()).isEqualTo(10);
+        assertThat(result.tokenUsage().outputTokenCount()).isEqualTo(5);
+        assertThat(result.tokenUsage().totalTokenCount()).isEqualTo(15);
     }
 
     @Test
@@ -326,6 +387,50 @@ class GoogleGenAiContentMapperTest {
 
         assertThat(result.aiMessage().text()).isEqualTo("Let me check the weather.");
         assertThat(result.aiMessage().toolExecutionRequests()).hasSize(1);
+    }
+
+    @Test
+    void should_return_tool_execution_finish_reason_when_response_contains_function_call() {
+        Map<String, Object> args = new HashMap<>();
+        args.put("city", "London");
+
+        GenerateContentResponse response = GenerateContentResponse.builder()
+                .candidates(List.of(Candidate.builder()
+                        .content(Content.builder()
+                                .role("model")
+                                .parts(Part.builder()
+                                        .functionCall(FunctionCall.builder()
+                                                .name("getWeather")
+                                                .args(args)
+                                                .build())
+                                        .build())
+                                .build())
+                        .finishReason(
+                                new com.google.genai.types.FinishReason(com.google.genai.types.FinishReason.Known.STOP))
+                        .build()))
+                .build();
+
+        ChatResponse result = GoogleGenAiContentMapper.toChatResponse(response, "test-model");
+
+        assertThat(result.finishReason()).isEqualTo(FinishReason.TOOL_EXECUTION);
+    }
+
+    @Test
+    void should_keep_reported_finish_reason_when_response_contains_no_function_call() {
+        GenerateContentResponse response = GenerateContentResponse.builder()
+                .candidates(List.of(Candidate.builder()
+                        .content(Content.builder()
+                                .role("model")
+                                .parts(Part.builder().text("Hello!").build())
+                                .build())
+                        .finishReason(
+                                new com.google.genai.types.FinishReason(com.google.genai.types.FinishReason.Known.STOP))
+                        .build()))
+                .build();
+
+        ChatResponse result = GoogleGenAiContentMapper.toChatResponse(response, "test-model");
+
+        assertThat(result.finishReason()).isEqualTo(FinishReason.STOP);
     }
 
     @Test
@@ -458,5 +563,218 @@ class GoogleGenAiContentMapperTest {
 
         assertThat(result.parts().get()).hasSize(2);
         assertThat(result.parts().get().get(0).text().get()).isEqualTo("Describe this image");
+    }
+
+    @Test
+    void should_map_finish_reason() {
+        assertThat(GoogleGenAiContentMapper.mapFinishReason(
+                        new com.google.genai.types.FinishReason(com.google.genai.types.FinishReason.Known.STOP)))
+                .isEqualTo(FinishReason.STOP);
+
+        assertThat(GoogleGenAiContentMapper.mapFinishReason(
+                        new com.google.genai.types.FinishReason(com.google.genai.types.FinishReason.Known.MAX_TOKENS)))
+                .isEqualTo(FinishReason.LENGTH);
+
+        assertThat(GoogleGenAiContentMapper.mapFinishReason(new com.google.genai.types.FinishReason(
+                        com.google.genai.types.FinishReason.Known.IMAGE_RECITATION)))
+                .isEqualTo(FinishReason.CONTENT_FILTER);
+
+        assertThat(GoogleGenAiContentMapper.mapFinishReason(
+                        new com.google.genai.types.FinishReason(com.google.genai.types.FinishReason.Known.SAFETY)))
+                .isEqualTo(FinishReason.CONTENT_FILTER);
+
+        assertThat(GoogleGenAiContentMapper.mapFinishReason(
+                        new com.google.genai.types.FinishReason(com.google.genai.types.FinishReason.Known.OTHER)))
+                .isEqualTo(FinishReason.OTHER);
+    }
+
+    @Test
+    void should_map_null_finish_reason_to_other() {
+        assertThat(GoogleGenAiContentMapper.mapFinishReason(null)).isEqualTo(FinishReason.OTHER);
+    }
+
+    private static GenerateContentResponse responseWithThoughtAndAnswer() {
+        return GenerateContentResponse.builder()
+                .candidates(List.of(Candidate.builder()
+                        .content(Content.builder()
+                                .role("model")
+                                .parts(List.of(
+                                        Part.builder()
+                                                .text("Let me work through this.")
+                                                .thought(true)
+                                                .build(),
+                                        Part.builder().text("42").build()))
+                                .build())
+                        .build()))
+                .build();
+    }
+
+    @Test
+    void should_return_thought_summary_in_thinking_when_return_thinking_is_true() {
+        ChatResponse result =
+                GoogleGenAiContentMapper.toChatResponse(responseWithThoughtAndAnswer(), "test-model", true);
+
+        assertThat(result.aiMessage().thinking()).isEqualTo("Let me work through this.");
+        assertThat(result.aiMessage().text()).isEqualTo("42");
+    }
+
+    @Test
+    void should_drop_thought_summary_when_return_thinking_is_false() {
+        ChatResponse result =
+                GoogleGenAiContentMapper.toChatResponse(responseWithThoughtAndAnswer(), "test-model", false);
+
+        assertThat(result.aiMessage().thinking()).isNull();
+        assertThat(result.aiMessage().text()).isEqualTo("42");
+    }
+
+    @Test
+    void should_drop_thought_summary_when_return_thinking_is_not_set() {
+        ChatResponse result = GoogleGenAiContentMapper.toChatResponse(responseWithThoughtAndAnswer(), "test-model");
+
+        assertThat(result.aiMessage().thinking()).isNull();
+        assertThat(result.aiMessage().text()).isEqualTo("42");
+    }
+
+    @Test
+    void should_concatenate_multiple_thought_parts() {
+        GenerateContentResponse response = GenerateContentResponse.builder()
+                .candidates(List.of(Candidate.builder()
+                        .content(Content.builder()
+                                .role("model")
+                                .parts(List.of(
+                                        Part.builder().text("foo").thought(true).build(),
+                                        Part.builder().text("bar").thought(true).build(),
+                                        Part.builder().text("answer").build()))
+                                .build())
+                        .build()))
+                .build();
+
+        ChatResponse result = GoogleGenAiContentMapper.toChatResponse(response, "test-model", true);
+
+        assertThat(result.aiMessage().thinking()).isEqualTo("foobar");
+        assertThat(result.aiMessage().text()).isEqualTo("answer");
+    }
+
+    @Test
+    void should_treat_part_without_thought_flag_as_regular_text() {
+        GenerateContentResponse response = GenerateContentResponse.builder()
+                .candidates(List.of(Candidate.builder()
+                        .content(Content.builder()
+                                .role("model")
+                                .parts(List.of(Part.builder().text("plain").build()))
+                                .build())
+                        .build()))
+                .build();
+
+        ChatResponse result = GoogleGenAiContentMapper.toChatResponse(response, "test-model", true);
+
+        assertThat(result.aiMessage().thinking()).isNull();
+        assertThat(result.aiMessage().text()).isEqualTo("plain");
+    }
+
+    @Test
+    void should_return_thought_summary_alongside_tool_call_and_signature() {
+        FunctionCall functionCall = FunctionCall.builder()
+                .name("get_weather")
+                .id("call_1")
+                .args(Map.of("city", "Paris"))
+                .build();
+
+        GenerateContentResponse response = GenerateContentResponse.builder()
+                .candidates(List.of(Candidate.builder()
+                        .content(Content.builder()
+                                .role("model")
+                                .parts(List.of(
+                                        Part.builder()
+                                                .text("I should call the tool.")
+                                                .thought(true)
+                                                .build(),
+                                        Part.builder()
+                                                .functionCall(functionCall)
+                                                .thoughtSignature("sig".getBytes())
+                                                .build()))
+                                .build())
+                        .build()))
+                .build();
+
+        ChatResponse result = GoogleGenAiContentMapper.toChatResponse(response, "test-model", true);
+
+        assertThat(result.aiMessage().thinking()).isEqualTo("I should call the tool.");
+        assertThat(result.aiMessage().hasToolExecutionRequests()).isTrue();
+        assertThat(result.aiMessage().attribute("thought_signature_call_1", String.class))
+                .isEqualTo(Base64.getEncoder().encodeToString("sig".getBytes()));
+    }
+
+    @Test
+    void should_send_thinking_as_thought_part_before_text_when_send_thinking_is_true() {
+        AiMessage message = AiMessage.builder()
+                .text("The answer is 42.")
+                .thinking("Working it out.")
+                .build();
+
+        Content result = GoogleGenAiContentMapper.toContent(message, true);
+
+        List<Part> parts = result.parts().orElseThrow();
+        assertThat(parts).hasSize(2);
+        assertThat(parts.get(0).text()).hasValue("Working it out.");
+        assertThat(parts.get(0).thought()).hasValue(true);
+        assertThat(parts.get(1).text()).hasValue("The answer is 42.");
+        assertThat(parts.get(1).thought()).isEmpty();
+    }
+
+    @Test
+    void should_not_send_thinking_when_send_thinking_is_false() {
+        AiMessage message = AiMessage.builder()
+                .text("The answer is 42.")
+                .thinking("Working it out.")
+                .build();
+
+        Content result = GoogleGenAiContentMapper.toContent(message, false);
+
+        List<Part> parts = result.parts().orElseThrow();
+        assertThat(parts).hasSize(1);
+        assertThat(parts.get(0).text()).hasValue("The answer is 42.");
+    }
+
+    @Test
+    void should_not_add_thought_part_when_message_has_no_thinking() {
+        AiMessage message = AiMessage.from("The answer is 42.");
+
+        Content result = GoogleGenAiContentMapper.toContent(message, true);
+
+        List<Part> parts = result.parts().orElseThrow();
+        assertThat(parts).hasSize(1);
+        assertThat(parts.get(0).thought()).isEmpty();
+    }
+
+    @Test
+    void should_reattach_function_call_thought_signature_when_send_thinking_is_false() {
+        AiMessage message = AiMessage.builder()
+                .toolExecutionRequests(List.of(ToolExecutionRequest.builder()
+                        .id("call_1")
+                        .name("get_weather")
+                        .arguments("{\"city\":\"Paris\"}")
+                        .build()))
+                .attributes(
+                        Map.of("thought_signature_call_1", Base64.getEncoder().encodeToString("sig".getBytes())))
+                .build();
+
+        Content result = GoogleGenAiContentMapper.toContent(message, false);
+
+        List<Part> parts = result.parts().orElseThrow();
+        assertThat(parts).hasSize(1);
+        assertThat(parts.get(0).thoughtSignature()).hasValue("sig".getBytes());
+    }
+
+    @Test
+    void should_preserve_empty_text_part_when_send_thinking_is_false() {
+        AiMessage message = AiMessage.from("");
+
+        Content result = GoogleGenAiContentMapper.toContent(message, false);
+
+        List<Part> parts = result.parts().orElseThrow();
+        assertThat(parts).hasSize(1);
+        assertThat(parts.get(0).text()).hasValue("");
+        assertThat(parts.get(0).thought()).isEmpty();
     }
 }
